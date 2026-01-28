@@ -13,6 +13,7 @@
 #include <gst/gstmemory.h>
 #include <gst/gstpad.h>
 #include <gst/video/gstvideometa.h>
+#include <sys/epoll.h>
 #include <sys/eventfd.h>
 
 #include "flutter-pi.h"
@@ -157,7 +158,7 @@ struct gstplayer {
 
     GstElement *pipeline, *sink;
     GstBus *bus;
-    sd_event_source *busfd_events;
+    struct evsrc *busfd_events;
 
     bool is_live;
 };
@@ -608,11 +609,10 @@ static void on_bus_message(struct gstplayer *player, GstMessage *msg) {
     return;
 }
 
-static int on_bus_fd_ready(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+static enum event_handler_return on_bus_fd_ready(int fd, uint32_t revents, void *userdata) {
     struct gstplayer *player;
     GstMessage *msg;
 
-    (void) s;
     (void) fd;
     (void) revents;
 
@@ -628,7 +628,7 @@ static int on_bus_fd_ready(sd_event_source *s, int fd, uint32_t revents, void *u
 
     DEBUG_TRACE_END(player, "on_bus_fd_ready");
 
-    return 0;
+    return kNoAction_EventHandlerReturn;
 }
 
 static GstPadProbeReturn on_query_appsink(GstPad *pad, GstPadProbeInfo *info, void *userdata) {
@@ -844,7 +844,7 @@ void on_source_setup(GstElement *bin, GstElement *source, gpointer userdata) {
 
 static int init(struct gstplayer *player, bool force_sw_decoders) {
     GstStateChangeReturn state_change_return;
-    sd_event_source *busfd_event_source;
+    struct evsrc *busfd_event_source;
     GstElement *pipeline, *sink, *src;
     GstBus *bus;
     GstPad *pad;
@@ -956,7 +956,7 @@ static int init(struct gstplayer *player, bool force_sw_decoders) {
 
     gst_bus_get_pollfd(bus, &fd);
 
-    flutterpi_sd_event_add_io(&busfd_event_source, fd.fd, EPOLLIN, on_bus_fd_ready, player);
+    busfd_event_source = flutterpi_add_io(fd.fd, EPOLLIN, on_bus_fd_ready, player);
 
     LOG_DEBUG("Setting state to paused...\n");
     state_change_return = gst_element_set_state(GST_ELEMENT(pipeline), GST_STATE_PAUSED);
@@ -989,7 +989,8 @@ fail_unref_pipeline:
 
 static void maybe_deinit(struct gstplayer *player) {
     if (player->busfd_events != NULL) {
-        sd_event_source_unrefp(&player->busfd_events);
+        evsrc_destroy(player->busfd_events);
+        player->busfd_events = NULL;
     }
     if (player->sink != NULL) {
         gst_object_unref(GST_OBJECT(player->sink));

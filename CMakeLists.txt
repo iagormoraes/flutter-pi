@@ -94,10 +94,11 @@ include(CheckCCompilerFlag)
 include(FindPkgConfig)
 pkg_check_modules(DRM REQUIRED IMPORTED_TARGET libdrm)
 pkg_check_modules(GBM REQUIRED IMPORTED_TARGET gbm)
-pkg_check_modules(LIBSYSTEMD REQUIRED IMPORTED_TARGET libsystemd)
 pkg_check_modules(LIBINPUT REQUIRED IMPORTED_TARGET libinput)
 pkg_check_modules(LIBXKBCOMMON REQUIRED IMPORTED_TARGET xkbcommon)
 pkg_check_modules(LIBUDEV REQUIRED IMPORTED_TARGET libudev)
+pkg_check_modules(GLIB REQUIRED IMPORTED_TARGET glib-2.0)
+pkg_check_modules(GIO_UNIX REQUIRED IMPORTED_TARGET gio-unix-2.0)
 
 # find pthreads
 set(THREADS_PREFER_PTHREAD_FLAG ON)
@@ -152,10 +153,11 @@ add_library(
 target_link_libraries(flutterpi_module PUBLIC
   PkgConfig::DRM
   PkgConfig::GBM
-  PkgConfig::LIBSYSTEMD
   PkgConfig::LIBINPUT
   PkgConfig::LIBXKBCOMMON
   PkgConfig::LIBUDEV
+  PkgConfig::GLIB
+  PkgConfig::GIO_UNIX
   Threads::Threads
   ${CMAKE_DL_LIBS}
   rt m atomic

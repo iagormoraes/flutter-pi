@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <stdbool.h>
 
+#include <sys/epoll.h>
+
 #include <gst/gst.h>
 #include <gst/gstelementfactory.h>
 #include <gst/gstmessage.h>
@@ -49,11 +51,10 @@ static void audio_player_on_duration_update(struct audio_player *self);
 static void audio_player_on_seek_completed(struct audio_player *self);
 static void audio_player_on_playback_ended(struct audio_player *self);
 
-static int on_bus_fd_ready(sd_event_source *src, int fd, uint32_t revents, void *userdata) {
+static enum event_handler_return on_bus_fd_ready(int fd, uint32_t revents, void *userdata) {
     struct audio_player *player = userdata;
     GstMessage *msg;
 
-    (void) src;
     (void) fd;
     (void) revents;
 
@@ -67,7 +68,7 @@ static int on_bus_fd_ready(sd_event_source *src, int fd, uint32_t revents, void 
 
     /* DEBUG_TRACE_END(player, "on_bus_fd_ready"); */
 
-    return 0;
+    return kNoAction_EventHandlerReturn;
 }
 
 static void audio_player_source_setup(GstElement *playbin, GstElement *source, GstElement **p_src) {
@@ -81,7 +82,6 @@ static void audio_player_source_setup(GstElement *playbin, GstElement *source, G
 
 struct audio_player *audio_player_new(char *player_id, char *channel) {
     GPollFD fd;
-    sd_event_source *busfd_event_source;
     int ok;
 
     struct audio_player *self = malloc(sizeof(struct audio_player));
@@ -133,7 +133,7 @@ struct audio_player *audio_player_new(char *player_id, char *channel) {
 
     gst_bus_get_pollfd(self->bus, &fd);
 
-    flutterpi_sd_event_add_io(&busfd_event_source, fd.fd, EPOLLIN, on_bus_fd_ready, self);
+    flutterpi_add_io(fd.fd, EPOLLIN, on_bus_fd_ready, self);
 
     // Refresh continuously to emit recurring events
     g_timeout_add(1000, (GSourceFunc) audio_player_on_refresh, self);

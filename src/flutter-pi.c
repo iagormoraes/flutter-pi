@@ -35,8 +35,9 @@
 #include <libinput.h>
 #include <libudev.h>
 #include <linux/input.h>
-#include <sys/eventfd.h>
-#include <systemd/sd-event.h>
+#include <sys/epoll.h>
+#include <glib.h>
+#include <glib-unix.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
@@ -236,13 +237,10 @@ struct flutterpi {
         bool next_frame_request_is_secondary;
     } flutter;
 
-    /// main event loop
+    /// main event loop (GLib-based)
     pthread_t event_loop_thread;
-    pthread_mutex_t event_loop_mutex;
-    sd_event *event_loop;
-    int wakeup_event_loop_fd;
-
-    struct evloop *evloop;
+    GMainContext *main_context;
+    GMainLoop *main_loop;
 
     /**
      * @brief Manages all plugins.
@@ -587,10 +585,8 @@ UNUSED static FlutterTransformation on_get_transformation(void *userdata) {
     return MAT3F_AS_FLUTTER_TRANSFORM(geometry.view_to_display_transform);
 }
 
-atomic_int_least64_t platform_task_counter = 0;
-
 /// platform tasks
-static int on_execute_platform_task(sd_event_source *s, void *userdata) {
+static gboolean on_execute_platform_task(gpointer userdata) {
     struct platform_task *task;
     int ok;
 
@@ -601,17 +597,12 @@ static int on_execute_platform_task(sd_event_source *s, void *userdata) {
     }
 
     free(task);
-
-    sd_event_source_set_enabled(s, SD_EVENT_OFF);
-    sd_event_source_unrefp(&s);
-
-    return 0;
+    return G_SOURCE_REMOVE;
 }
 
 int flutterpi_post_platform_task(int (*callback)(void *userdata), void *userdata) {
     struct platform_task *task;
-    sd_event_source *src;
-    int ok;
+    GSource *source;
 
     task = malloc(sizeof *task);
     if (task == NULL) {
@@ -621,68 +612,28 @@ int flutterpi_post_platform_task(int (*callback)(void *userdata), void *userdata
     task->callback = callback;
     task->userdata = userdata;
 
-    if (pthread_self() != flutterpi->event_loop_thread) {
-        pthread_mutex_lock(&flutterpi->event_loop_mutex);
-    }
-
-    ok = sd_event_add_defer(flutterpi->event_loop, &src, on_execute_platform_task, task);
-    if (ok < 0) {
-        LOG_ERROR("Error posting platform task to main loop. sd_event_add_defer: %s\n", strerror(-ok));
-        ok = -ok;
-        goto fail_unlock_event_loop;
-    }
-
-    // Higher values mean lower priority. So later platform tasks are handled later too.
-    sd_event_source_set_priority(src, atomic_fetch_add(&platform_task_counter, 1));
-
-    if (pthread_self() != flutterpi->event_loop_thread) {
-        ok = write(flutterpi->wakeup_event_loop_fd, (uint8_t[8]){ 0, 0, 0, 0, 0, 0, 0, 1 }, 8);
-        if (ok < 0) {
-            ok = errno;
-            LOG_ERROR("Error arming main loop for platform task. write: %s\n", strerror(ok));
-            goto fail_unlock_event_loop;
-        }
-    }
-
-    if (pthread_self() != flutterpi->event_loop_thread) {
-        pthread_mutex_unlock(&flutterpi->event_loop_mutex);
-    }
+    // g_main_context_invoke_full is thread-safe and will automatically
+    // wake up the main loop if called from another thread
+    source = g_idle_source_new();
+    g_source_set_callback(source, on_execute_platform_task, task, NULL);
+    g_source_set_priority(source, G_PRIORITY_DEFAULT);
+    g_source_attach(source, flutterpi->main_context);
+    g_source_unref(source);
 
     return 0;
-
-fail_unlock_event_loop:
-    if (pthread_self() != flutterpi->event_loop_thread) {
-        pthread_mutex_unlock(&flutterpi->event_loop_mutex);
-    }
-
-    return ok;
 }
 
-/// timed platform tasks
-static int on_execute_platform_task_with_time(sd_event_source *s, uint64_t usec, void *userdata) {
-    struct platform_task *task;
-    int ok;
-
-    (void) usec;
-
-    task = userdata;
-    ok = task->callback(task->userdata);
-    if (ok != 0) {
-        LOG_ERROR("Error executing timed platform task: %s\n", strerror(ok));
-    }
-
-    free(task);
-
-    sd_event_source_set_enabled(s, SD_EVENT_OFF);
-    sd_event_source_unrefp(&s);
-
-    return 0;
+static uint64_t get_monotonic_time_usec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000000 + (uint64_t) ts.tv_nsec / 1000;
 }
 
 int flutterpi_post_platform_task_with_time(int (*callback)(void *userdata), void *userdata, uint64_t target_time_usec) {
     struct platform_task *task;
-    //sd_event_source *source;
-    int ok;
+    GSource *source;
+    uint64_t now_usec, delay_usec;
+    guint delay_ms;
 
     task = malloc(sizeof *task);
     if (task == NULL) {
@@ -692,73 +643,91 @@ int flutterpi_post_platform_task_with_time(int (*callback)(void *userdata), void
     task->callback = callback;
     task->userdata = userdata;
 
-    if (pthread_self() != flutterpi->event_loop_thread) {
-        pthread_mutex_lock(&flutterpi->event_loop_mutex);
+    now_usec = get_monotonic_time_usec();
+    delay_usec = (target_time_usec > now_usec) ? (target_time_usec - now_usec) : 0;
+    delay_ms = (guint) (delay_usec / 1000);
+
+    // Use idle source for immediate execution, timeout source for delayed
+    if (delay_ms == 0) {
+        source = g_idle_source_new();
+    } else {
+        source = g_timeout_source_new(delay_ms);
     }
 
-    ok = sd_event_add_time(flutterpi->event_loop, NULL, CLOCK_MONOTONIC, target_time_usec, 1, on_execute_platform_task_with_time, task);
-    if (ok < 0) {
-        LOG_ERROR("Error posting platform task to main loop. sd_event_add_time: %s\n", strerror(-ok));
-        ok = -ok;
-        goto fail_unlock_event_loop;
-    }
-
-    if (pthread_self() != flutterpi->event_loop_thread) {
-        ok = write(flutterpi->wakeup_event_loop_fd, (uint8_t[8]){ 0, 0, 0, 0, 0, 0, 0, 1 }, 8);
-        if (ok < 0) {
-            perror("[flutter-pi] Error arming main loop for platform task. write");
-            ok = errno;
-            goto fail_unlock_event_loop;
-        }
-    }
-
-    if (pthread_self() != flutterpi->event_loop_thread) {
-        pthread_mutex_unlock(&flutterpi->event_loop_mutex);
-    }
+    g_source_set_callback(source, on_execute_platform_task, task, NULL);
+    g_source_attach(source, flutterpi->main_context);
+    g_source_unref(source);
 
     return 0;
-
-fail_unlock_event_loop:
-    if (pthread_self() != flutterpi->event_loop_thread) {
-        pthread_mutex_unlock(&flutterpi->event_loop_mutex);
-    }
-    free(task);
-    return ok;
 }
 
-int flutterpi_sd_event_add_io(sd_event_source **source_out, int fd, uint32_t events, sd_event_io_handler_t callback, void *userdata) {
-    int ok;
+// Internal evsrc structure for flutterpi_add_io
+struct evsrc {
+    struct evloop *loop;
+    GSource *gsource;
+    evloop_io_handler_t io_callback;
+    void *userdata;
+    int fd;
+};
 
-    if (pthread_self() != flutterpi->event_loop_thread) {
-        pthread_mutex_lock(&flutterpi->event_loop_mutex);
+static gboolean on_flutterpi_io_ready(gint fd, GIOCondition condition, gpointer userdata) {
+    struct evsrc *evsrc = userdata;
+    enum event_handler_return ret;
+    uint32_t revents = 0;
+
+    ASSERT_NOT_NULL(evsrc);
+
+    // Convert GIOCondition to EPOLL-style events
+    if (condition & G_IO_IN)   revents |= EPOLLIN;
+    if (condition & G_IO_OUT)  revents |= EPOLLOUT;
+    if (condition & G_IO_ERR)  revents |= EPOLLERR;
+    if (condition & G_IO_HUP)  revents |= EPOLLHUP;
+    if (condition & G_IO_PRI)  revents |= EPOLLPRI;
+
+    ret = evsrc->io_callback(fd, revents, evsrc->userdata);
+
+    if (ret == kRemoveSrc_EventHandlerReturn) {
+        return G_SOURCE_REMOVE;
     }
 
-    ok = sd_event_add_io(flutterpi->event_loop, source_out, fd, events, callback, userdata);
-    if (ok < 0) {
-        LOG_ERROR("Could not add IO callback to event loop. sd_event_add_io: %s\n", strerror(-ok));
-        return -ok;
+    return G_SOURCE_CONTINUE;
+}
+
+struct evsrc *flutterpi_add_io(int fd, uint32_t events, evloop_io_handler_t callback, void *userdata) {
+    struct evsrc *evsrc;
+    GSource *source;
+    GIOCondition condition = 0;
+
+    // Convert EPOLL events to GIOCondition
+    if (events & EPOLLIN)    condition |= G_IO_IN;
+    if (events & EPOLLOUT)   condition |= G_IO_OUT;
+    if (events & EPOLLERR)   condition |= G_IO_ERR;
+    if (events & EPOLLHUP)   condition |= G_IO_HUP;
+    if (events & EPOLLRDHUP) condition |= G_IO_HUP;  // EPOLLRDHUP maps to G_IO_HUP
+    if (events & EPOLLPRI)   condition |= G_IO_PRI;
+
+    evsrc = malloc(sizeof *evsrc);
+    if (evsrc == NULL) {
+        return NULL;
     }
 
-    if (pthread_self() != flutterpi->event_loop_thread) {
-        ok = write(flutterpi->wakeup_event_loop_fd, (uint8_t[8]){ 0, 0, 0, 0, 0, 0, 0, 1 }, 8);
-        if (ok < 0) {
-            perror("[flutter-pi] Error arming main loop for io callback. write");
-            ok = errno;
-            goto fail_unlock_event_loop;
-        }
+    source = g_unix_fd_source_new(fd, condition);
+    if (source == NULL) {
+        LOG_ERROR("Could not create GLib Unix FD source.\n");
+        free(evsrc);
+        return NULL;
     }
 
-    if (pthread_self() != flutterpi->event_loop_thread) {
-        pthread_mutex_unlock(&flutterpi->event_loop_mutex);
-    }
+    evsrc->loop = NULL;  // Not using evloop here, using flutterpi's context directly
+    evsrc->gsource = source;
+    evsrc->io_callback = callback;
+    evsrc->userdata = userdata;
+    evsrc->fd = fd;
 
-    return 0;
+    g_source_set_callback(source, (GSourceFunc) on_flutterpi_io_ready, evsrc, NULL);
+    g_source_attach(source, flutterpi->main_context);
 
-fail_unlock_event_loop:
-    if (pthread_self() != flutterpi->event_loop_thread) {
-        pthread_mutex_unlock(&flutterpi->event_loop_mutex);
-    }
-    return ok;
+    return evsrc;
 }
 
 /// flutter tasks
@@ -1061,38 +1030,20 @@ static bool runs_platform_tasks_on_current_thread(void *userdata) {
     return flutterpi_runs_platform_tasks_on_current_thread(userdata);
 }
 
-static int on_wakeup_main_loop(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
-    uint8_t buffer[8];
-    int ok;
-
-    (void) s;
-    (void) revents;
-    (void) userdata;
-
-    ok = read(fd, buffer, 8);
-    if (ok < 0) {
-        perror("[flutter-pi] Could not read mainloop wakeup userdata. read");
-        return errno;
-    }
-
-    return 0;
-}
-
 /**************************
  * DISPLAY INITIALIZATION *
  **************************/
-static int on_drmdev_ready(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+static enum event_handler_return on_drmdev_ready(int fd, uint32_t revents, void *userdata) {
     struct drmdev *drmdev;
 
-    (void) s;
     (void) fd;
     (void) revents;
-    (void) userdata;
 
     ASSERT_NOT_NULL(userdata);
     drmdev = userdata;
 
-    return drmdev_on_event_fd_ready(drmdev);
+    drmdev_on_event_fd_ready(drmdev);
+    return kNoAction_EventHandlerReturn;
 }
 
 static const FlutterLocale *on_compute_platform_resolved_locales(const FlutterLocale **locales, size_t n_locales) {
@@ -1380,7 +1331,7 @@ static int flutterpi_run(struct flutterpi *flutterpi) {
     struct view_geometry geometry;
     FlutterEngineResult engine_result;
     FlutterEngine engine;
-    int ok, evloop_fd;
+    int ok;
 
     procs = &flutterpi->flutter.procs;
 
@@ -1473,87 +1424,11 @@ static int flutterpi_run(struct flutterpi *flutterpi) {
         goto fail_shutdown_engine;
     }
 
-    pthread_mutex_lock(&flutterpi->event_loop_mutex);
-
-    ok = sd_event_get_fd(flutterpi->event_loop);
-    if (ok < 0) {
-        ok = -ok;
-        LOG_ERROR("Could not get fd for main event loop. sd_event_get_fd: %s\n", strerror(ok));
-        pthread_mutex_unlock(&flutterpi->event_loop_mutex);
-        goto fail_shutdown_engine;
-    }
-
-    pthread_mutex_unlock(&flutterpi->event_loop_mutex);
-
-    evloop_fd = ok;
-
-    {
-        fd_set rfds, wfds, xfds;
-        int state;
-        FD_ZERO(&rfds);
-        FD_ZERO(&wfds);
-        FD_ZERO(&xfds);
-        FD_SET(evloop_fd, &rfds);
-        FD_SET(evloop_fd, &wfds);
-        FD_SET(evloop_fd, &xfds);
-
-        const fd_set const_fds = rfds;
-
-        pthread_mutex_lock(&flutterpi->event_loop_mutex);
-
-        do {
-            state = sd_event_get_state(flutterpi->event_loop);
-            switch (state) {
-                case SD_EVENT_INITIAL:
-                    ok = sd_event_prepare(flutterpi->event_loop);
-                    if (ok < 0) {
-                        ok = -ok;
-                        LOG_ERROR("Could not prepare event loop. sd_event_prepare: %s\n", strerror(ok));
-                        goto fail_shutdown_engine;
-                    }
-
-                    break;
-                case SD_EVENT_ARMED:
-                    pthread_mutex_unlock(&flutterpi->event_loop_mutex);
-
-                    do {
-                        rfds = const_fds;
-                        wfds = const_fds;
-                        xfds = const_fds;
-                        ok = select(evloop_fd + 1, &rfds, &wfds, &xfds, NULL);
-                        if ((ok < 0) && (errno != EINTR)) {
-                            ok = errno;
-                            LOG_ERROR("Could not wait for event loop events. select: %s\n", strerror(ok));
-                            goto fail_shutdown_engine;
-                        }
-                    } while ((ok < 0) && (errno == EINTR));
-
-                    pthread_mutex_lock(&flutterpi->event_loop_mutex);
-
-                    ok = sd_event_wait(flutterpi->event_loop, 0);
-                    if (ok < 0) {
-                        ok = -ok;
-                        LOG_ERROR("Could not check for event loop events. sd_event_wait: %s\n", strerror(ok));
-                        goto fail_shutdown_engine;
-                    }
-
-                    break;
-                case SD_EVENT_PENDING:
-                    ok = sd_event_dispatch(flutterpi->event_loop);
-                    if (ok < 0) {
-                        ok = -ok;
-                        LOG_ERROR("Could not dispatch event loop events. sd_event_dispatch: %s\n", strerror(ok));
-                        goto fail_shutdown_engine;
-                    }
-
-                    break;
-                case SD_EVENT_FINISHED: break;
-                default: UNREACHABLE();
-            }
-        } while (state != SD_EVENT_FINISHED);
-
-        pthread_mutex_unlock(&flutterpi->event_loop_mutex);
-    }
+    // Run the GLib main loop - this is much simpler than the sd-event state machine
+    // GLib handles all the select/poll/epoll internally and is thread-safe
+    g_main_context_push_thread_default(flutterpi->main_context);
+    g_main_loop_run(flutterpi->main_loop);
+    g_main_context_pop_thread_default(flutterpi->main_context);
 
     // We deinitialize the plugins here so plugins don't attempt to use the
     // flutter engine anymore.
@@ -1575,42 +1450,8 @@ fail_deinitialize_engine:
 }
 
 void flutterpi_schedule_exit(struct flutterpi *flutterpi) {
-    int ok;
-
-    if (pthread_self() != flutterpi->event_loop_thread) {
-        pthread_mutex_lock(&flutterpi->event_loop_mutex);
-    }
-
-    // There's a race condition here:
-    //
-    // Other threads can always call flutterpi_post_platform_task(). We can only
-    // be sure flutterpi_post_platform_task() will not be called anymore when
-    // FlutterEngineShutdown() has returned.
-    //
-    // However, FlutterEngineShutdown() is blocking and should be called on the
-    // platform thread.
-    //
-    // 1. If we process them all, that's basically just continuing to run the
-    //    application.
-    //
-    // 2. If we don't process them and just error, that could result in memory
-    //    leaks.
-    //
-    // There's not really a nice solution here, but we use the 2nd option here.
-    ok = sd_event_exit(flutterpi->event_loop, 0);
-    if (ok < 0) {
-        LOG_ERROR("Could not schedule application exit. sd_event_exit: %s\n", strerror(-ok));
-        if (pthread_self() != flutterpi->event_loop_thread) {
-            pthread_mutex_unlock(&flutterpi->event_loop_mutex);
-        }
-        return;
-    }
-
-    if (pthread_self() != flutterpi->event_loop_thread) {
-        pthread_mutex_unlock(&flutterpi->event_loop_mutex);
-    }
-
-    return;
+    // g_main_loop_quit is thread-safe, no mutex needed
+    g_main_loop_quit(flutterpi->main_loop);
 }
 
 /**************
@@ -1821,16 +1662,15 @@ static void on_user_input_close(int fd, void *userdata) {
     }
 }
 
-static int on_user_input_fd_ready(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+static enum event_handler_return on_user_input_fd_ready(int fd, uint32_t revents, void *userdata) {
     struct user_input *input;
 
-    (void) s;
     (void) fd;
     (void) revents;
 
     input = userdata;
-
-    return user_input_on_fd_ready(input);
+    user_input_on_fd_ready(input);
+    return kNoAction_EventHandlerReturn;
 }
 
 static struct flutter_paths *setup_paths(enum flutter_runtime_mode runtime_mode, const char *app_bundle_path) {
@@ -2290,14 +2130,12 @@ static void on_session_disable(struct libseat *seat, void *userdata) {
     fpi->session_active = false;
 }
 
-static int on_libseat_fd_ready(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+static enum event_handler_return on_libseat_fd_ready(int fd, uint32_t revents, void *userdata) {
     struct flutterpi *fpi;
     int ok;
 
-    ASSERT_NOT_NULL(s);
     ASSERT_NOT_NULL(userdata);
     fpi = userdata;
-    (void) s;
     (void) fd;
     (void) revents;
 
@@ -2306,7 +2144,7 @@ static int on_libseat_fd_ready(sd_event_source *s, int fd, uint32_t revents, voi
         LOG_ERROR("Couldn't dispatch libseat events. libseat_dispatch: %s\n", strerror(errno));
     }
 
-    return 0;
+    return kNoAction_EventHandlerReturn;
 }
 #endif
 
@@ -2326,7 +2164,8 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
     struct user_input *input;
     struct compositor *compositor;
     struct flutterpi *fpi;
-    struct sd_event *event_loop;
+    GMainContext *main_context;
+    GMainLoop *main_loop;
     struct flutterpi_cmdline_args cmd_args;
     struct libseat *libseat;
     struct locales *locales;
@@ -2335,7 +2174,8 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
     struct window *window;
     void *engine_handle;
     char *bundle_path, **engine_argv, *desired_videomode;
-    int ok, engine_argc, wakeup_fd;
+    int ok, engine_argc;
+    int libseat_fd;
 
     fpi = malloc(sizeof *fpi);
     if (fpi == NULL) {
@@ -2386,22 +2226,17 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
         goto fail_free_cmd_args;
     }
 
-    wakeup_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-    if (wakeup_fd < 0) {
-        LOG_ERROR("Could not create fd for waking up the main loop. eventfd: %s\n", strerror(errno));
+    // Create GLib main context and loop
+    main_context = g_main_context_new();
+    if (main_context == NULL) {
+        LOG_ERROR("Could not create GLib main context.\n");
         goto fail_free_paths;
     }
 
-    ok = sd_event_new(&event_loop);
-    if (ok < 0) {
-        LOG_ERROR("Could not create main event loop. sd_event_new: %s\n", strerror(-ok));
-        goto fail_close_wakeup_fd;
-    }
-
-    ok = sd_event_add_io(event_loop, NULL, wakeup_fd, EPOLLIN, on_wakeup_main_loop, NULL);
-    if (ok < 0) {
-        LOG_ERROR("Error adding wakeup callback to main loop. sd_event_add_io: %s\n", strerror(-ok));
-        goto fail_unref_event_loop;
+    main_loop = g_main_loop_new(main_context, FALSE);
+    if (main_loop == NULL) {
+        LOG_ERROR("Could not create GLib main loop.\n");
+        goto fail_unref_main_context;
     }
 
 #ifdef HAVE_LIBSEAT
@@ -2413,8 +2248,8 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
     }
 
     if (libseat != NULL) {
-        ok = libseat_get_fd(libseat);
-        if (ok < 0) {
+        libseat_fd = libseat_get_fd(libseat);
+        if (libseat_fd < 0) {
             LOG_ERROR(
                 "Couldn't get an event fd from libseat. Flutter-pi will run without session switching support. libseat_get_fd: %s\n",
                 strerror(errno)
@@ -2425,12 +2260,9 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
     }
 
     if (libseat != NULL) {
-        ok = sd_event_add_io(event_loop, NULL, ok, EPOLLIN, on_libseat_fd_ready, fpi);
-        if (ok < 0) {
-            LOG_ERROR(
-                "Couldn't listen for libseat events. Flutter-pi will run without session switching support. sd_event_add_io: %s\n",
-                strerror(-ok)
-            );
+        struct evsrc *libseat_evsrc = flutterpi_add_io(libseat_fd, EPOLLIN, on_libseat_fd_ready, fpi);
+        if (libseat_evsrc == NULL) {
+            LOG_ERROR("Couldn't listen for libseat events. Flutter-pi will run without session switching support.\n");
             libseat_close_seat(libseat);
             libseat = NULL;
         }
@@ -2584,9 +2416,9 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
 
     /// TODO: Do we really need the window after this?
     if (drmdev != NULL) {
-        ok = sd_event_add_io(event_loop, NULL, drmdev_get_event_fd(drmdev), EPOLLIN | EPOLLHUP | EPOLLPRI, on_drmdev_ready, drmdev);
-        if (ok < 0) {
-            LOG_ERROR("Could not add DRM pageflip event listener. sd_event_add_io: %s\n", strerror(-ok));
+        struct evsrc *drmdev_evsrc = flutterpi_add_io(drmdev_get_event_fd(drmdev), EPOLLIN | EPOLLHUP | EPOLLPRI, on_drmdev_ready, drmdev);
+        if (drmdev_evsrc == NULL) {
+            LOG_ERROR("Could not add DRM pageflip event listener.\n");
             goto fail_unref_compositor;
         }
     }
@@ -2620,26 +2452,17 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
     if (input == NULL) {
         LOG_ERROR("Couldn't initialize user input. flutter-pi will run without user input.\n");
     } else {
-        sd_event_source *user_input_event_source;
-
-        ok = sd_event_add_io(
-            event_loop,
-            &user_input_event_source,
+        struct evsrc *user_input_evsrc = flutterpi_add_io(
             user_input_get_fd(input),
             EPOLLIN | EPOLLRDHUP | EPOLLPRI,
             on_user_input_fd_ready,
             input
         );
-        if (ok < 0) {
-            LOG_ERROR("Couldn't listen for user input. flutter-pi will run without user input. sd_event_add_io: %s\n", strerror(-ok));
+        if (user_input_evsrc == NULL) {
+            LOG_ERROR("Couldn't listen for user input. flutter-pi will run without user input.\n");
             user_input_destroy(input);
             input = NULL;
         }
-
-        sd_event_source_set_priority(user_input_event_source, SD_EVENT_PRIORITY_IDLE - 10);
-
-        sd_event_source_set_floating(user_input_event_source, true);
-        sd_event_source_unref(user_input_event_source);
     }
 
     engine_handle = load_flutter_engine_lib(paths);
@@ -2717,10 +2540,9 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
     frame_scheduler_unref(scheduler);
     window_unref(window);
 
-    pthread_mutex_init(&fpi->event_loop_mutex, get_default_mutex_attrs());
     fpi->event_loop_thread = pthread_self();
-    fpi->wakeup_event_loop_fd = wakeup_fd;
-    fpi->event_loop = event_loop;
+    fpi->main_context = main_context;
+    fpi->main_loop = main_loop;
     fpi->locales = locales;
     fpi->tracer = tracer;
     fpi->compositor = compositor;
@@ -2795,11 +2617,11 @@ fail_destroy_libseat:
 #endif
     }
 
-fail_unref_event_loop:
-    sd_event_unrefp(&event_loop);
+fail_unref_main_loop:
+    g_main_loop_unref(main_loop);
 
-fail_close_wakeup_fd:
-    close(wakeup_fd);
+fail_unref_main_context:
+    g_main_context_unref(main_context);
 
 fail_free_paths:
     flutter_paths_free(paths);
@@ -2817,7 +2639,6 @@ void flutterpi_destroy(struct flutterpi *flutterpi) {
     (void) flutterpi;
     LOG_DEBUG("deinit\n");
 
-    pthread_mutex_destroy(&flutterpi->event_loop_mutex);
     texture_registry_destroy(flutterpi->texture_registry);
     plugin_registry_destroy(flutterpi->plugin_registry);
     unload_flutter_engine_lib(flutterpi->flutter.engine_handle);
@@ -2847,8 +2668,8 @@ void flutterpi_destroy(struct flutterpi *flutterpi) {
         UNREACHABLE();
 #endif
     }
-    sd_event_unrefp(&flutterpi->event_loop);
-    close(flutterpi->wakeup_event_loop_fd);
+    g_main_loop_unref(flutterpi->main_loop);
+    g_main_context_unref(flutterpi->main_context);
     flutter_paths_free(flutterpi->flutter.paths);
     free(flutterpi->flutter.bundle_path);
     free(flutterpi);

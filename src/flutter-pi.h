@@ -24,9 +24,10 @@
 #include <flutter_embedder.h>
 #include <libinput.h>
 #include <linux/input.h>
-#include <systemd/sd-event.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
+
+#include "event_loop.h"
 
 #include "cursor.h"
 #include "pixel_format.h"
@@ -152,7 +153,7 @@ int flutterpi_post_platform_task(int (*callback)(void *userdata), void *userdata
 
 int flutterpi_post_platform_task_with_time(int (*callback)(void *userdata), void *userdata, uint64_t target_time_usec);
 
-int flutterpi_sd_event_add_io(sd_event_source **source_out, int fd, uint32_t events, sd_event_io_handler_t callback, void *userdata);
+struct evsrc *flutterpi_add_io(int fd, uint32_t events, evloop_io_handler_t callback, void *userdata);
 
 int flutterpi_send_platform_message(
     struct flutterpi *flutterpi,
