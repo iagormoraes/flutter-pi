@@ -2175,7 +2175,6 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
     void *engine_handle;
     char *bundle_path, **engine_argv, *desired_videomode;
     int ok, engine_argc;
-    int libseat_fd;
 
     fpi = malloc(sizeof *fpi);
     if (fpi == NULL) {
@@ -2241,6 +2240,7 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
 
 #ifdef HAVE_LIBSEAT
     static const struct libseat_seat_listener libseat_interface = { .enable_seat = on_session_enable, .disable_seat = on_session_disable };
+    int libseat_fd;
 
     libseat = libseat_open_seat(&libseat_interface, fpi);
     if (libseat == NULL) {
@@ -2617,10 +2617,10 @@ fail_destroy_libseat:
 #endif
     }
 
-fail_unref_main_loop:
-    g_main_loop_unref(main_loop);
-
 fail_unref_main_context:
+    if (main_loop != NULL) {
+        g_main_loop_unref(main_loop);
+    }
     g_main_context_unref(main_context);
 
 fail_free_paths:

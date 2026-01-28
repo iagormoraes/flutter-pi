@@ -12,6 +12,7 @@
 
 #include <stdint.h>
 
+#include "util/collection.h"
 #include "util/refcounting.h"
 
 struct evloop;
