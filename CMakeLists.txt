@@ -128,6 +128,7 @@ add_library(
   src/platformchannel.c
   src/pluginregistry.c
   src/texture_registry.c
+  src/event_loop.c
   src/modesetting.c
   src/util/collection.c
   src/util/bitscan.c
