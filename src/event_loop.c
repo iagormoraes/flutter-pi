@@ -9,6 +9,7 @@
 #include <glib.h>
 #include <glib-unix.h>
 
+#include "util/asserts.h"
 #include "util/collection.h"
 #include "util/logging.h"
 #include "util/refcounting.h"
