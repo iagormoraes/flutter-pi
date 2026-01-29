@@ -39,6 +39,10 @@ option(TRY_BUILD_GSTREAMER_AUDIO_PLAYER_PLUGIN "Don't throw an error if the gstr
 option(BUILD_SENTRY_PLUGIN "Include the sentry plugin in the finished binary. Allows for crash reporting to sentry.io." OFF)
 
 option(BUILD_CHARSET_CONVERTER_PLUGIN "Include the charset converter plugin in the finished binary." OFF)
+
+option(BUILD_FLUTTER_WEBRTC_PLUGIN "Include the flutter webrtc plugin in the finished binary." OFF)
+option(TRY_BUILD_FLUTTER_WEBRTC_PLUGIN "Don't throw an error if webrtc libs aren't found, instead just don't build the flutter webrtc plugin in that case." ON)
+
 option(ENABLE_OPENGL "Build with EGL/OpenGL rendering support." ON)
 option(TRY_ENABLE_OPENGL "Don't throw an error if EGL/OpenGL aren't found, instead just build without EGL/OpenGL support in that case." ON)
 option(ENABLE_VULKAN "Build with Vulkan rendering support." OFF)
@@ -380,6 +384,33 @@ endif()
 
 if (BUILD_CHARSET_CONVERTER_PLUGIN)
   target_sources(flutterpi_module PRIVATE src/plugins/charset_converter.c)
+endif()
+
+if (BUILD_FLUTTER_WEBRTC_PLUGIN)
+  if (TRY_BUILD_FLUTTER_WEBRTC_PLUGIN)
+    pkg_check_modules(LIBWEBRTC IMPORTED_TARGET webrtc)
+  else()
+    pkg_check_modules(LIBWEBRTC REQUIRED IMPORTED_TARGET webrtc)
+  endif()
+
+    target_sources(flutterpi_module PRIVATE
+    src/plugins/flutter_webrtc/plugin.c
+  )
+
+  if (LIBWEBRTC_FOUND)
+    target_link_libraries(flutterpi_module PUBLIC
+      PkgConfig::LIBWEBRTC
+    )
+    target_compile_definitions(flutterpi_module PRIVATE HAVE_LIBWEBRTC)
+    set(HAVE_LIBWEBRTC ON)
+  else()
+    if (TRY_BUILD_FLUTTER_WEBRTC_PLUGIN)
+      set(HAVE_LIBWEBRTC OFF)
+      message(NOTICE "Couldn't find webrtc libraries. Building flutter webrtc plugin as stub.")
+    else()
+      message(SEND_ERROR "Couldn't find webrtc libraries and TRY_BUILD_FLUTTER_WEBRTC_PLUGIN is OFF.")
+    endif()
+  endif()
 endif()
 
 # Sentry Plugin
